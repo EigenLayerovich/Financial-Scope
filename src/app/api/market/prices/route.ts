@@ -2,7 +2,7 @@ import { NextResponse } from 'next/server'
 import { getSnapshots, MARKET_SYMBOLS } from '@/lib/finance-api'
 import { db } from '@/lib/db'
 
-// Symbol display names
+// Symbol display names mapping
 const SYMBOL_NAMES: Record<string, string> = {
   '^GSPC': 'S&P 500',
   'GC=F': 'Gold',
@@ -18,14 +18,14 @@ const SYMBOL_NAMES: Record<string, string> = {
   'USDKZT': 'USD/KZT',
 }
 
-// Default prices for fallback (realistic current market prices)
-const DEFAULT_PRICES: Record<string, { price: number; change24h: number; high: number; low: number }> = {
-  'SP500': { price: 5340.52, change24h: 0.15, high: 5365.20, low: 5318.40 },
-  'GOLD': { price: 2935.50, change24h: 0.32, high: 2948.30, low: 2920.10 },
-  'SILVER': { price: 33.25, change24h: -0.18, high: 33.80, low: 32.90 },
-  'BTC': { price: 96500.00, change24h: 1.25, high: 97200.00, low: 95500.00 },
-  'ETH': { price: 2725.00, change24h: 0.85, high: 2750.00, low: 2690.00 },
-  'USDKZT': { price: 494.62, change24h: 0.12, high: 496.50, low: 492.30 },
+// Map API symbols to display symbols
+const SYMBOL_MAP: Record<string, string> = {
+  '^GSPC': 'SP500',
+  'GC=F': 'GOLD',
+  'SI=F': 'SILVER',
+  'BTC-USD': 'BTC',
+  'ETH-USD': 'ETH',
+  'KZT=X': 'USDKZT',
 }
 
 export async function GET() {
@@ -49,161 +49,91 @@ export async function GET() {
       volume: number | null
     }> = []
 
-    let usedFallback = false
-    const requestStartTime = Date.now()
+    let dataSource = 'live'
 
     try {
-      // Set a timeout for the API call
-      const timeoutPromise = new Promise<null>((_, reject) => 
-        setTimeout(() => reject(new Error('Request timeout')), 20000)
-      )
+      // Fetch data from Finance API with timeout
+      const controller = new AbortController()
+      const timeoutId = setTimeout(() => controller.abort(), 15000)
       
-      const snapshotData = await Promise.race([
-        getSnapshots(symbols),
-        timeoutPromise
-      ]) as any[] | null
+      const snapshotData = await getSnapshots(symbols)
+      clearTimeout(timeoutId)
       
       if (snapshotData && snapshotData.length > 0) {
         for (const item of snapshotData) {
-          // Normalize symbol names
-          let symbolName = item.ticker || item.symbol
-          let displayName = item.name || item.ticker || item.symbol
+          // Get the display symbol
+          const displaySymbol = SYMBOL_MAP[item.ticker] || item.ticker
+          const displayName = SYMBOL_NAMES[item.ticker] || item.name
           
-          // Map symbols to readable names
-          if (symbolName === '^GSPC') {
-            displayName = 'S&P 500'
-            symbolName = 'SP500'
-          } else if (symbolName === 'GC=F') {
-            displayName = 'Gold'
-            symbolName = 'GOLD'
-          } else if (symbolName === 'SI=F') {
-            displayName = 'Silver'
-            symbolName = 'SILVER'
-          } else if (symbolName === 'BTC-USD') {
-            displayName = 'Bitcoin'
-            symbolName = 'BTC'
-          } else if (symbolName === 'ETH-USD') {
-            displayName = 'Ethereum'
-            symbolName = 'ETH'
-          } else if (symbolName === 'KZT=X') {
-            displayName = 'USD/KZT'
-            symbolName = 'USDKZT'
+          const priceData = {
+            symbol: displaySymbol,
+            name: displayName,
+            price: item.price,
+            change24h: item.changePercent,
+            high24h: item.high,
+            low24h: item.low,
+            volume: item.volume,
           }
-
-          // Validate price
-          const defaultPrice = DEFAULT_PRICES[symbolName]
-          let price = item.price || 0
           
-          // If price seems wrong, use default
-          if (defaultPrice && (price <= 0 || price < defaultPrice.price * 0.5 || price > defaultPrice.price * 2)) {
-            price = defaultPrice.price
-          }
+          prices.push(priceData)
 
-          if (price > 0) {
-            const priceData = {
-              symbol: symbolName,
-              name: displayName,
-              price: price,
-              change24h: item.changePercent ?? defaultPrice?.change24h ?? null,
-              high24h: item.high ?? defaultPrice?.high ?? null,
-              low24h: item.low ?? defaultPrice?.low ?? null,
-              volume: item.volume || null,
-            }
-            
-            prices.push(priceData)
-
-            // Store in database for caching
-            try {
-              await db.marketPrice.upsert({
-                where: { symbol: symbolName },
-                update: {
-                  name: displayName,
-                  price: priceData.price,
-                  change24h: priceData.change24h,
-                  high24h: priceData.high24h,
-                  low24h: priceData.low24h,
-                  volume: priceData.volume,
-                  updatedAt: new Date(),
-                },
-                create: priceData,
-              })
-            } catch (dbError) {
-              console.error('DB error:', dbError)
-            }
+          // Store in database for caching
+          try {
+            await db.marketPrice.upsert({
+              where: { symbol: displaySymbol },
+              update: {
+                name: displayName,
+                price: priceData.price,
+                change24h: priceData.change24h,
+                high24h: priceData.high24h,
+                low24h: priceData.low24h,
+                volume: priceData.volume,
+                updatedAt: new Date(),
+              },
+              create: priceData,
+            })
+          } catch (dbError) {
+            console.error('DB error:', dbError)
           }
         }
-      }
-      
-      if (prices.length === 0) {
-        usedFallback = true
+        
+        console.log('Successfully fetched live prices:', prices.map(p => `${p.symbol}: ${p.price}`).join(', '))
       }
     } catch (apiError) {
       console.error('Finance API error, falling back to cached data:', apiError)
-      usedFallback = true
+      dataSource = 'cache'
     }
 
-    // Fallback to database cache or default prices
-    if (usedFallback) {
+    // Fallback to database cache if needed
+    if (prices.length === 0) {
       const cachedPrices = await db.marketPrice.findMany()
       
       if (cachedPrices.length > 0) {
-        // Check if cache is recent (within 1 hour)
-        const oneHourAgo = new Date(Date.now() - 60 * 60 * 1000)
-        const hasRecent = cachedPrices.some(p => p.updatedAt > oneHourAgo)
-        
-        if (hasRecent) {
-          prices = cachedPrices.map(p => ({
-            symbol: p.symbol,
-            name: p.name,
-            price: p.price,
-            change24h: p.change24h,
-            high24h: p.high24h,
-            low24h: p.low24h,
-            volume: p.volume,
-          }))
-        }
-      }
-      
-      // If still no prices, use defaults
-      if (prices.length === 0) {
-        prices = Object.entries(DEFAULT_PRICES).map(([symbol, data]) => ({
-          symbol,
-          name: SYMBOL_NAMES[symbol] || symbol,
-          price: data.price,
-          change24h: data.change24h,
-          high24h: data.high,
-          low24h: data.low,
-          volume: null,
+        prices = cachedPrices.map(p => ({
+          symbol: p.symbol,
+          name: p.name,
+          price: p.price,
+          change24h: p.change24h,
+          high24h: p.high24h,
+          low24h: p.low24h,
+          volume: p.volume,
         }))
+        dataSource = 'cache'
       }
     }
 
-    // Ensure we have all required symbols
+    // Ensure all required symbols are present
     const requiredSymbols = ['SP500', 'GOLD', 'SILVER', 'BTC', 'ETH', 'USDKZT']
     for (const symbol of requiredSymbols) {
       if (!prices.find(p => p.symbol === symbol)) {
-        const defaultData = DEFAULT_PRICES[symbol]
-        if (defaultData) {
-          prices.push({
-            symbol,
-            name: SYMBOL_NAMES[symbol] || symbol,
-            price: defaultData.price,
-            change24h: defaultData.change24h,
-            high24h: defaultData.high,
-            low24h: defaultData.low,
-            volume: null,
-          })
-        }
+        console.warn(`Missing price for ${symbol}`)
       }
     }
-
-    const requestTime = Date.now() - requestStartTime
 
     return NextResponse.json({ 
       prices,
       timestamp: new Date().toISOString(),
-      source: usedFallback ? 'cache' : 'live',
-      responseTime: `${requestTime}ms`,
+      source: dataSource,
     })
   } catch (error) {
     console.error('Error in market prices API:', error)

@@ -1,0 +1,72 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// Cryptocurrency news and analysis
+model CryptoNews {
+  id          String   @id @default(cuid())
+  title       String
+  summary     String?
+  source      String?
+  url         String
+  category    String   // news, analysis, prediction
+  publishedAt DateTime
+  createdAt   DateTime @default(now())
+}
+
+// Market prices for various assets
+model MarketPrice {
+  id          String   @id @default(cuid())
+  symbol      String   @unique // BTC, ETH, SP500, GOLD, SILVER, USDKZT
+  name        String
+  price       Float
+  change24h   Float?   // Percentage change in 24h
+  high24h     Float?
+  low24h      Float?
+  volume      Float?
+  updatedAt   DateTime @default(now())
+}
+
+// Historical price data for charts
+model PriceHistory {
+  id        String   @id @default(cuid())
+  symbol    String
+  price     Float
+  high      Float?
+  low       Float?
+  volume    Float?
+  timestamp DateTime
+  interval  String   // 1h, 1d, 1wk
+  
+  @@index([symbol, timestamp])
+}
+
+// Analysis and predictions
+model Analysis {
+  id          String   @id @default(cuid())
+  symbol      String   // BTC, ETH, etc.
+  type        String   // analysis, prediction
+  title       String
+  content     String
+  source      String?
+  sentiment   String?  // bullish, bearish, neutral
+  targetPrice Float?
+  timeframe   String?  // 1d, 1w, 1m, 3m, 1y
+  createdAt   DateTime @default(now())
+}
+
+// App settings for tracking last update
+model AppSetting {
+  id        String   @id @default(cuid())
+  key       String   @unique
+  value     String
+  updatedAt DateTime @default(now())
+}

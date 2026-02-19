@@ -1,7 +1,5 @@
 // Finance API client for fetching market data
-// Uses the Finance API via gateway with web search fallback
-
-import ZAI from 'z-ai-web-dev-sdk'
+// Uses the Finance API via gateway
 
 const GATEWAY_URL = process.env.GATEWAY_URL || 'https://internal-api.z.ai';
 const API_PREFIX = process.env.API_PREFIX || '/external/finance';
@@ -36,25 +34,6 @@ interface NewsItem {
   publishedAt: string;
 }
 
-// Known price ranges for validation
-const PRICE_RANGES: Record<string, { min: number; max: number; unit: string }> = {
-  'BTC-USD': { min: 50000, max: 150000, unit: 'USD' },
-  'ETH-USD': { min: 1000, max: 5000, unit: 'USD' },
-  '^GSPC': { min: 4000, max: 7000, unit: 'points' },
-  'GC=F': { min: 1500, max: 3500, unit: 'USD/oz' },
-  'SI=F': { min: 15, max: 50, unit: 'USD/oz' },
-  'KZT=X': { min: 400, max: 600, unit: 'KZT' },
-}
-
-let zaiInstance: Awaited<ReturnType<typeof ZAI.create>> | null = null;
-
-async function getZAI() {
-  if (!zaiInstance) {
-    zaiInstance = await ZAI.create();
-  }
-  return zaiInstance;
-}
-
 async function fetchFinanceAPI(endpoint: string) {
   const url = `${GATEWAY_URL}${API_PREFIX}${endpoint}`;
   
@@ -71,98 +50,31 @@ async function fetchFinanceAPI(endpoint: string) {
   return response.json();
 }
 
-// Get price via web search fallback
-async function getPriceViaWebSearch(symbol: string, displayName: string): Promise<QuoteResponse | null> {
-  try {
-    const zai = await getZAI();
-    const results = await zai.functions.invoke('web_search', {
-      query: `${displayName} current price USD today`,
-      num: 5,
-    });
-
-    if (results && results.length > 0) {
-      // Combine snippets to find price
-      const combinedText = results.map((r: any) => `${r.name} ${r.snippet}`).join(' ');
-      
-      // Get expected range
-      const range = PRICE_RANGES[symbol] || { min: 0, max: Infinity, unit: 'USD' };
-      
-      // Try to find all numbers that could be prices
-      const allNumbers = combinedText.match(/\$?([\d,]+\.?\d{0,2})/g) || [];
-      
-      let price = 0;
-      let high = 0;
-      let low = 0;
-      let changePercent = 0;
-      
-      // Find a price within expected range
-      for (const numStr of allNumbers) {
-        const num = parseFloat(numStr.replace(/[$,]/g, ''));
-        if (!isNaN(num) && num >= range.min && num <= range.max) {
-          if (price === 0 || Math.abs(num - (range.min + range.max) / 2) < Math.abs(price - (range.min + range.max) / 2)) {
-            price = num;
-          }
-        }
-      }
-      
-      // If no price found in range, use default
-      if (price === 0) {
-        price = (range.min + range.max) / 2;
-      }
-      
-      // Try to extract high/low
-      const highMatch = combinedText.match(/high[\s:]*\$?([\d,]+\.?\d*)/i);
-      const lowMatch = combinedText.match(/low[\s:]*\$?([\d,]+\.?\d*)/i);
-      
-      if (highMatch) {
-        const h = parseFloat(highMatch[1].replace(/,/g, ''));
-        if (!isNaN(h) && h > price) high = h;
-      }
-      if (lowMatch) {
-        const l = parseFloat(lowMatch[1].replace(/,/g, ''));
-        if (!isNaN(l) && l < price) low = l;
-      }
-      
-      if (!high) high = price * 1.01;
-      if (!low) low = price * 0.99;
-
-      // Try to extract change
-      const changeMatch = combinedText.match(/([+-]?[\d.]+)%/);
-      if (changeMatch) {
-        changePercent = parseFloat(changeMatch[1]);
-      }
-
-      return {
-        ticker: symbol,
-        name: displayName,
-        price,
-        change: 0,
-        changePercent,
-        high,
-        low,
-        open: price,
-        volume: 0,
-      };
-    }
-  } catch (error) {
-    console.error('Web search fallback error:', error);
-  }
-  return null;
+// Parse the API response body to extract quote data
+function parseQuoteData(data: any): QuoteResponse {
+  return {
+    ticker: data.symbol || '',
+    name: data.shortName || data.longName || data.symbol || '',
+    price: data.regularMarketPrice || data.price || 0,
+    change: data.regularMarketChange || data.change || 0,
+    changePercent: data.regularMarketChangePercent || data.changePercent || 0,
+    high: data.regularMarketDayHigh || data.high || 0,
+    low: data.regularMarketDayLow || data.low || 0,
+    open: data.regularMarketOpen || data.open || 0,
+    volume: data.regularMarketVolume || data.volume || 0,
+    marketCap: data.marketCap || undefined,
+  };
 }
 
 // Get real-time quote for a single stock
-export async function getQuote(ticker: string, type: string = 'STOCKS', displayName?: string): Promise<QuoteResponse | null> {
+export async function getQuote(ticker: string, type: string = 'STOCKS'): Promise<QuoteResponse | null> {
   try {
     const data = await fetchFinanceAPI(`/v1/markets/quote?ticker=${ticker}&type=${type}`);
-    if (data && data.price) {
-      return data;
+    if (data && (data.regularMarketPrice || data.price)) {
+      return parseQuoteData(data);
     }
   } catch (error) {
-    console.error(`Finance API error for ${ticker}, trying web search:`, error);
-    
-    // Fallback to web search
-    const name = displayName || ticker;
-    return getPriceViaWebSearch(ticker, name);
+    console.error(`Error fetching quote for ${ticker}:`, error);
   }
   return null;
 }
@@ -170,39 +82,18 @@ export async function getQuote(ticker: string, type: string = 'STOCKS', displayN
 // Get snapshot quotes for multiple stocks
 export async function getSnapshots(tickers: string[]): Promise<QuoteResponse[]> {
   try {
-    const data = await fetchFinanceAPI(`/v1/markets/stock/quotes?ticker=${tickers.join(',')}`);
-    if (data && Array.isArray(data) && data.length > 0 && data.some((d: any) => d.price > 0)) {
-      return data;
+    const response = await fetchFinanceAPI(`/v1/markets/stock/quotes?ticker=${tickers.join(',')}`);
+    
+    // The API returns data in a 'body' array
+    const body = response.body || response;
+    
+    if (Array.isArray(body) && body.length > 0) {
+      return body.map((item: any) => parseQuoteData(item));
     }
   } catch (error) {
-    console.error('Finance API error for snapshots, trying web search fallback:', error);
+    console.error('Error fetching snapshots:', error);
   }
-  
-  // Fallback to web search for each symbol
-  const symbolNames: Record<string, string> = {
-    '^GSPC': 'S&P 500 index',
-    'GC=F': 'Gold price',
-    'SI=F': 'Silver price',
-    'BTC-USD': 'Bitcoin BTC',
-    'ETH-USD': 'Ethereum ETH',
-    'KZT=X': 'USD to KZT exchange rate',
-  };
-
-  const results: QuoteResponse[] = [];
-  
-  for (const ticker of tickers) {
-    const displayName = symbolNames[ticker] || ticker;
-    try {
-      const quote = await getPriceViaWebSearch(ticker, displayName);
-      if (quote && quote.price > 0) {
-        results.push(quote);
-      }
-    } catch (error) {
-      console.error(`Error fetching ${ticker}:`, error);
-    }
-  }
-  
-  return results;
+  return [];
 }
 
 // Get historical data
@@ -212,8 +103,8 @@ export async function getHistory(symbol: string, interval: string = '1d', limit?
     if (limit) {
       endpoint += `&limit=${limit}`;
     }
-    const data = await fetchFinanceAPI(endpoint);
-    return data?.body || [];
+    const response = await fetchFinanceAPI(endpoint);
+    return response?.body || [];
   } catch (error) {
     console.error(`Error fetching history for ${symbol}:`, error);
     return [];
